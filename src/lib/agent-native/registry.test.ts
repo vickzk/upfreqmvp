@@ -169,6 +169,7 @@ describe('Agent-Native Action Registry & MCP Gateway', () => {
     expect(namespaces.has('upfreq.workspace')).toBe(true);
     expect(namespaces.has('upfreq.bridge')).toBe(true);
     expect(namespaces.has('upfreq.cad')).toBe(true);
+    expect(namespaces.has('upfreq.simulation_data_sync_setup')).toBe(true);
   });
 
   it('enforces Policy Engine: ALLOWED actions execute immediately', async () => {
@@ -432,6 +433,68 @@ describe('Agent-Native Action Registry & MCP Gateway', () => {
       expect(attached.data.robot.urdfXacroXml).toContain('link name="sensor_mount_link"');
       expect(attached.data.robot.urdfXacroXml).toContain(saveResult.data.part.stlUrl);
       expect(attached.data.robot.urdfXacroXml).toContain('</robot>'); // still well-formed
+    });
+  });
+
+  describe('simulation_data_sync_setup: laptop -> GPU machine MinIO sync', () => {
+    const ctx = { source: 'mcp' as const, userId: TEST_USER_ID };
+    const NS = 'upfreq.simulation_data_sync_setup';
+    const runOf = (result: any) => result.data.steps.map((s: any) => s.run).join('\n');
+
+    it('setup_sim_sync returns the full runbook for the agent to execute, in order', async () => {
+      const result = await registry.execute(`${NS}.setup_sim_sync`, { sshTarget: 'ubuntu@10.0.0.42' }, ctx);
+      expect(result.success).toBe(true);
+      expect(result.data.agentInstructions).toMatch(/Run every step yourself/);
+      const run = runOf(result);
+      const order = ['docker compose version', "echo ssh_ok", 'MINIO_BUCKET_NAME sim-data-files', 'docker pull -q ghcr.io/upfreq-robotics/minio_sync:latest',
+        'up -d --force-recreate minio\n', 'cat > ~/.upfreq/runtime.env', 'grep -c "^>"', '--profile sync up -d --force-recreate minio_gpu_sync', 'sync_ok'];
+      const positions = order.map(needle => run.indexOf(needle));
+      expect(positions.every(p => p >= 0)).toBe(true);
+      expect([...positions].sort((a, b) => a - b)).toEqual(positions);
+    });
+
+    it('setup_sim_sync requires the GPU machine\'s ssh target', async () => {
+      const result = await registry.execute(`${NS}.setup_sim_sync`, {}, ctx);
+      expect(result.success).toBe(false);
+      expect(result.error).toMatch(/sshTarget/);
+    });
+
+    it('keeps credentials on the user\'s machines: generated locally, compared by checksum, never echoed', async () => {
+      const result = await registry.execute(`${NS}.setup_sim_sync`, { sshTarget: 'ubuntu@10.0.0.42', sshPort: 2222, sshKeyPath: '~/.ssh/id_ed25519' }, ctx);
+      const run = runOf(result);
+      expect(run).toContain('SSH="ssh -o BatchMode=yes -o ConnectTimeout=10 -p 2222 -i $HOME/.ssh/id_ed25519 ubuntu@10.0.0.42"');
+      expect(run).toContain('grep -v "^GPU_MINIO_ENDPOINT=" "$ENV" | $SSH');
+      expect(run).toContain('STOP: the GPU machine already has DIFFERENT MinIO credentials');
+      expect(run).not.toMatch(/cat "?\$(HOME\/\.upfreq\/runtime\.env|ENV)"?\s*$/m);
+    });
+
+    it('start_sync refuses to delete GPU-only objects unless the user allowed it', async () => {
+      const guarded = runOf(await registry.execute(`${NS}.start_sync`, {}, ctx));
+      expect(guarded).toContain('STOP: the sync mirrors with --remove');
+      const allowed = runOf(await registry.execute(`${NS}.start_sync`, { allowGpuDeletes: true }, ctx));
+      expect(allowed).not.toContain('STOP:');
+      expect(allowed).toContain('user approved deleting them');
+    });
+
+    it('init_config uses gpuMinioHost when given, else resolves the ssh host', async () => {
+      const explicit = runOf(await registry.execute(`${NS}.init_config`, { sshTarget: 'gpubox', gpuMinioHost: '100.64.0.7', bucketName: 'robot-runs' }, ctx));
+      expect(explicit).toContain('GPU_HOST=100.64.0.7');
+      expect(explicit).toContain('set_kv MINIO_BUCKET_NAME robot-runs');
+      expect(runOf(await registry.execute(`${NS}.init_config`, { sshTarget: 'gpubox' }, ctx))).toContain("ssh -G gpubox");
+    });
+
+    it('rejects inputs that could inject into the generated shell commands', async () => {
+      const bad = [
+        ['check_gpu_ssh', { sshTarget: 'ubuntu@host; rm -rf ~' }],
+        ['setup_gpu_minio', { sshTarget: 'ubuntu@host', sshKeyPath: '~/.ssh/key $(whoami)' }],
+        ['init_config', { sshTarget: 'ubuntu@host', gpuMinioHost: 'host`id`' }],
+        ['init_config', { sshTarget: 'ubuntu@host', bucketName: 'sim_data_files' }],
+      ] as const;
+      for (const [name, args] of bad) {
+        const result = await registry.execute(`${NS}.${name}`, args, ctx);
+        expect(result.success).toBe(false);
+        expect(result.policyStatus).toBe('denied');
+      }
     });
   });
 

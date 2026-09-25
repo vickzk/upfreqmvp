@@ -9,6 +9,7 @@ import { testingActions } from './actions/testing';
 import { workspaceActions } from './actions/workspace';
 import { bridgeActions } from './actions/bridge';
 import { cadActions } from './actions/cad';
+import { simulationDataSyncSetupActions } from './actions/simulation-data-sync-setup';
 import { evaluateActionPolicy, createPolicyProposal } from './policy-engine';
 
 class ActionRegistry {
@@ -26,6 +27,7 @@ class ActionRegistry {
       ...workspaceActions,
       ...bridgeActions,
       ...cadActions,
+      ...simulationDataSyncSetupActions,
     ]);
   }
 
